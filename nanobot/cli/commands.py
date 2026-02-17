@@ -197,6 +197,63 @@ def onboard():
 
 
 
+def _create_workspace_templates(workspace: Path):
+    """Create default workspace template files."""
+    templates = {
+        "AGENTS.md": """# Agent Instructions
+
+You are a helpful AI assistant. Be concise, accurate, and friendly.
+
+## Guidelines
+
+- Always explain what you're doing before taking actions
+- Ask for clarification when the request is ambiguous
+- Use tools to help accomplish tasks
+- Use memory tools (create_memory, find_memory_cache) to remember and recall information
+""",
+        "SOUL.md": """# Soul
+
+I am nanobot, a lightweight AI assistant.
+
+## Personality
+
+- Helpful and friendly
+- Concise and to the point
+- Curious and eager to learn
+
+## Values
+
+- Accuracy over speed
+- User privacy and safety
+- Transparency in actions
+""",
+        "USER.md": """# User
+
+Information about the user goes here.
+
+## Preferences
+
+- Communication style: (casual/formal)
+- Timezone: (your timezone)
+- Language: (your preferred language)
+""",
+    }
+    
+    for filename, content in templates.items():
+        file_path = workspace / filename
+        if not file_path.exists():
+            file_path.write_text(content)
+            console.print(f"  [dim]Created {filename}[/dim]")
+    
+    # Create memory directory (graph.db is auto-created by GraphMemoryStore)
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    console.print("  [dim]Created memory/ (graph memory auto-initializes on first use)[/dim]")
+
+    # Create skills directory for custom user skills
+    skills_dir = workspace / "skills"
+    skills_dir.mkdir(exist_ok=True)
+
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
@@ -254,8 +311,8 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.session.manager import SessionManager
-
+    from loguru import logger
+    
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
@@ -337,56 +394,54 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
-    def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
-        enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
-        return "cli", "direct"
+    # ExtendChannel needs direct AgentLoop reference (bypasses MessageBus for streaming)
+    if config.channels.extend.enabled:
+        try:
+            from nanobot.channels.extend import ExtendChannel
+            channels.channels["extend"] = ExtendChannel(
+                config.channels.extend, bus, agent
+            )
+            logger.info("Extend channel enabled")
+        except ImportError as e:
+            logger.warning(f"Extend channel not available: {e}")
 
-    # Create heartbeat service
-    async def on_heartbeat_execute(tasks: str) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+    if config.channels.extend_chat.enabled:
+        try:
+            from nanobot.channels.extend_chat import ExtendChatChannel
+            from nanobot.channels.extend_chat.robots import RobotManager
 
-        async def _silent(*_args, **_kwargs):
-            pass
+            robot_manager = RobotManager()
+            ecfg = config.channels.extend_chat
 
-        return await agent.process_direct(
-            tasks,
-            session_key="heartbeat",
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,
-        )
+            if ecfg.robots:
+                for rid, rcfg in ecfg.robots.items():
+                    rws = Path(rcfg.workspace).expanduser()
+                    rsm = SessionManager(rws)
+                    ragent = AgentLoop(
+                        bus=bus,
+                        provider=provider,
+                        workspace=rws,
+                        model=rcfg.model or config.agents.defaults.model,
+                        temperature=config.agents.defaults.temperature,
+                        max_tokens=config.agents.defaults.max_tokens,
+                        max_iterations=config.agents.defaults.max_tool_iterations,
+                        memory_window=rcfg.memory_window or config.agents.defaults.memory_window,
+                        brave_api_key=config.tools.web.search.api_key or None,
+                        exec_config=config.tools.exec,
+                        restrict_to_workspace=config.tools.restrict_to_workspace,
+                        session_manager=rsm,
+                        mcp_servers=config.tools.mcp_servers,
+                    )
+                    robot_manager.register(rid, ragent)
+            else:
+                robot_manager.register("default", agent)
 
-    async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel."""
-        from nanobot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
-            return  # No external channel available to deliver to
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-
-    hb_cfg = config.gateway.heartbeat
-    heartbeat = HeartbeatService(
-        workspace=config.workspace_path,
-        provider=provider,
-        model=agent.model,
-        on_execute=on_heartbeat_execute,
-        on_notify=on_heartbeat_notify,
-        interval_s=hb_cfg.interval_s,
-        enabled=hb_cfg.enabled,
-    )
+            channels.channels["extend_chat"] = ExtendChatChannel(
+                ecfg, bus, robot_manager
+            )
+            logger.info("Extend-chat channel enabled")
+        except ImportError as e:
+            logger.warning(f"Extend-chat channel not available: {e}")
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")

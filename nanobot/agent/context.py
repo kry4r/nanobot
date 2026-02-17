@@ -8,39 +8,59 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.graph_memory import GraphMemoryStore
 from nanobot.agent.skills import SkillsLoader
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """
+    Builds the context (system prompt + messages) for the agent.
+
+    Assembles bootstrap files, memory, skills, and conversation history
+    into a coherent prompt for the LLM.
+    """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
-    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, memory: GraphMemoryStore | None = None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory = memory or GraphMemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        """
+        Build the system prompt from bootstrap files, memory, and skills.
 
+        Args:
+            skill_names: Optional list of skills to include.
+
+        Returns:
+            Complete system prompt.
+        """
+        parts = []
+
+        # Core identity
+        parts.append(self._get_identity())
+
+        # Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
+        # Memory context
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
+        # Skills - progressive loading
+        # 1. Always-loaded skills: include full content
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
+        # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
             parts.append(f"""# Skills
@@ -54,6 +74,10 @@ Skills with available="false" need dependencies installed first - you can try in
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
+        import time as _time
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
@@ -67,8 +91,7 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Graph memory: {workspace_path}/memory/graph.db (use memory tools to search/create/update)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -89,6 +112,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+
+Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
+When remembering something important, use the create_memory tool.
+To recall past events, use the find_memory_cache tool."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -150,8 +177,24 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: str,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        """
+        Add a tool result to the message list.
+
+        Args:
+            messages: Current message list.
+            tool_call_id: ID of the tool call.
+            tool_name: Name of the tool.
+            result: Tool execution result.
+
+        Returns:
+            Updated message list.
+        """
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": result
+        })
         return messages
 
     def add_assistant_message(
@@ -161,11 +204,28 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list."""
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        """
+        Add an assistant message to the message list.
+
+        Args:
+            messages: Current message list.
+            content: Message content.
+            tool_calls: Optional tool calls.
+            reasoning_content: Thinking output (Kimi, DeepSeek-R1, etc.).
+
+        Returns:
+            Updated message list.
+        """
+        msg: dict[str, Any] = {"role": "assistant"}
+
+        # Omit empty content — some backends reject empty text blocks
+        if content:
+            msg["content"] = content
+
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        if reasoning_content is not None:
+        # Include reasoning content when provided (required by some thinking models)
+        if reasoning_content:
             msg["reasoning_content"] = reasoning_content
         if thinking_blocks:
             msg["thinking_blocks"] = thinking_blocks
