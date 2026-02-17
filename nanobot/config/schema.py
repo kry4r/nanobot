@@ -163,8 +163,91 @@ class QQConfig(Base):
     secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
+class ExtendConfig(BaseModel):
+    """Extend channel: WebSocket/HTTP gateway for external apps."""
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+    auth_tokens: list[str] = Field(default_factory=list)  # Bearer tokens for authentication
+    allow_from: list[str] = Field(default_factory=list)
+    summary_threshold: int = 20  # Old messages to accumulate before generating summary
+    recent_window: int = 8  # Recent conversation turns to keep in full
 
-class ChannelsConfig(Base):
+
+class SplitterConfig(BaseModel):
+    """Response splitting into sentence-level messages."""
+    enabled: bool = True
+    delimiters: list[str] = Field(default_factory=lambda: ["。", "！", "？", "…", "\n\n"])
+    typing_speed_ms_per_char: int = 100
+    jitter_ratio: float = 0.3
+    min_delay_ms: int = 500
+    max_delay_ms: int = 4000
+    min_sentence_length: int = 4
+
+
+class ImperfectionConfig(BaseModel):
+    """Humanlike imperfection injection."""
+    enabled: bool = True
+    prompt_injection: bool = True
+    post_processing: bool = True
+    typo_probability: float = 0.025
+    punctuation_casualness: float = 0.15
+    homophone_dict_path: str = ""  # Empty = use built-in
+
+
+class AggregatorConfig(BaseModel):
+    """Buffer rapid user messages before triggering LLM."""
+    enabled: bool = True
+    default_timeout_ms: int = 3000
+    fast_typing_threshold_ms: int = 2000
+    fast_typing_extension_ms: int = 2000
+    complete_sentence_reduction_ms: int = 1500
+    max_window_ms: int = 15000
+    max_messages: int = 10
+
+
+class EagerReplyConfig(BaseModel):
+    """Proactive nudge when user types for too long."""
+    enabled: bool = True
+    typing_timeout_ms: int = 10000
+    max_eager_per_turn: int = 2
+    cooldown_ms: int = 20000
+    pool_size: int = 8  # Cached nudge phrases per session
+
+
+class HumanlikeChatConfig(BaseModel):
+    """Top-level humanlike chat behavior configuration."""
+    enabled: bool = True
+    splitter: SplitterConfig = Field(default_factory=SplitterConfig)
+    imperfection: ImperfectionConfig = Field(default_factory=ImperfectionConfig)
+    aggregator: AggregatorConfig = Field(default_factory=AggregatorConfig)
+    eager_reply: EagerReplyConfig = Field(default_factory=EagerReplyConfig)
+
+
+class RobotConfig(BaseModel):
+    """Per-robot configuration for extend-chat multi-robot support."""
+    workspace: str
+    model: str | None = None
+    extra_system_prompt: str = ""
+    memory_window: int | None = None
+    idle_timeout_minutes: int = 30
+
+
+class ExtendChatConfig(BaseModel):
+    """Extend-chat channel: humanlike WebSocket gateway for chat bots."""
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8081
+    auth_tokens: list[str] = Field(default_factory=list)
+    allow_from: list[str] = Field(default_factory=list)
+    summary_threshold: int = 20
+    recent_window: int = 8
+    humanlike: HumanlikeChatConfig = Field(default_factory=HumanlikeChatConfig)
+    robots: dict[str, RobotConfig] = Field(default_factory=dict)
+    idle_timeout_minutes: int = 30
+
+
+class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
 
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
@@ -176,6 +259,8 @@ class ChannelsConfig(Base):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    extend: ExtendConfig = Field(default_factory=ExtendConfig)
+    extend_chat: ExtendChatConfig = Field(default_factory=ExtendChatConfig)
 
 
 class AgentDefaults(Base):

@@ -210,7 +210,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Always explain what you're doing before taking actions
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
-- Remember important information in memory/MEMORY.md; past events are logged in memory/HISTORY.md
+- Use memory tools (create_memory, find_memory_cache) to remember and recall information
 """,
         "SOUL.md": """# Soul
 
@@ -246,33 +246,10 @@ Information about the user goes here.
             file_path.write_text(content)
             console.print(f"  [dim]Created {filename}[/dim]")
     
-    # Create memory directory and MEMORY.md
+    # Create memory directory (graph.db is auto-created by GraphMemoryStore)
     memory_dir = workspace / "memory"
     memory_dir.mkdir(exist_ok=True)
-    memory_file = memory_dir / "MEMORY.md"
-    if not memory_file.exists():
-        memory_file.write_text("""# Long-term Memory
-
-This file stores important information that should persist across sessions.
-
-## User Information
-
-(Important facts about the user)
-
-## Preferences
-
-(User preferences learned over time)
-
-## Important Notes
-
-(Things to remember)
-""")
-        console.print("  [dim]Created memory/MEMORY.md[/dim]")
-    
-    history_file = memory_dir / "HISTORY.md"
-    if not history_file.exists():
-        history_file.write_text("")
-        console.print("  [dim]Created memory/HISTORY.md[/dim]")
+    console.print("  [dim]Created memory/ (graph memory auto-initializes on first use)[/dim]")
 
     # Create skills directory for custom user skills
     skills_dir = workspace / "skills"
@@ -336,6 +313,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from loguru import logger
     
     if verbose:
         import logging
@@ -403,7 +381,56 @@ def gateway(
     
     # Create channel manager
     channels = ChannelManager(config, bus)
-    
+
+    # ExtendChannel needs direct AgentLoop reference (bypasses MessageBus for streaming)
+    if config.channels.extend.enabled:
+        try:
+            from nanobot.channels.extend import ExtendChannel
+            channels.channels["extend"] = ExtendChannel(
+                config.channels.extend, bus, agent
+            )
+            logger.info("Extend channel enabled")
+        except ImportError as e:
+            logger.warning(f"Extend channel not available: {e}")
+
+    if config.channels.extend_chat.enabled:
+        try:
+            from nanobot.channels.extend_chat import ExtendChatChannel
+            from nanobot.channels.extend_chat.robots import RobotManager
+
+            robot_manager = RobotManager()
+            ecfg = config.channels.extend_chat
+
+            if ecfg.robots:
+                for rid, rcfg in ecfg.robots.items():
+                    rws = Path(rcfg.workspace).expanduser()
+                    rsm = SessionManager(rws)
+                    ragent = AgentLoop(
+                        bus=bus,
+                        provider=provider,
+                        workspace=rws,
+                        model=rcfg.model or config.agents.defaults.model,
+                        temperature=config.agents.defaults.temperature,
+                        max_tokens=config.agents.defaults.max_tokens,
+                        max_iterations=config.agents.defaults.max_tool_iterations,
+                        memory_window=rcfg.memory_window or config.agents.defaults.memory_window,
+                        brave_api_key=config.tools.web.search.api_key or None,
+                        exec_config=config.tools.exec,
+                        restrict_to_workspace=config.tools.restrict_to_workspace,
+                        session_manager=rsm,
+                        mcp_servers=config.tools.mcp_servers,
+                    )
+                    robot_manager.register(rid, ragent)
+            else:
+                robot_manager.register("default", agent)
+
+            channels.channels["extend_chat"] = ExtendChatChannel(
+                ecfg, bus, robot_manager
+            )
+            logger.info("Extend-chat channel enabled")
+        except ImportError as e:
+            logger.warning(f"Extend-chat channel not available: {e}")
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:

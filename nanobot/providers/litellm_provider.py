@@ -3,6 +3,7 @@
 import json
 import json_repair
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import litellm
@@ -206,3 +207,44 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """Stream chat completion, yielding text chunks."""
+        model = self._resolve_model(model or self.default_model)
+        max_tokens = max(1, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        self._apply_model_overrides(model, kwargs)
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+
+        # Streaming doesn't support tool_choice — tools are handled
+        # in the non-streaming iterations before the final streaming call.
+
+        try:
+            response = await acompletion(**kwargs)
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    yield delta.content
+        except Exception as e:
+            yield f"Error calling LLM: {str(e)}"

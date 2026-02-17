@@ -20,8 +20,7 @@ You have access to:
 
 ## Memory
 
-- `memory/MEMORY.md` — long-term facts (preferences, context, relationships)
-- `memory/HISTORY.md` — append-only event log, search with grep to recall past events
+- `memory/graph.db` — graph-structured associative memory (SQLite). Use `find_memory_cache` to recall and `create_memory` to store.
 
 ## Scheduled Reminders
 
@@ -31,7 +30,7 @@ nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:
 ```
 Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
 
-**Do NOT just write reminders to MEMORY.md** — that won't trigger actual notifications.
+**Do NOT just create a memory node for reminders** — that won't trigger actual notifications.
 
 ## Heartbeat Tasks
 
