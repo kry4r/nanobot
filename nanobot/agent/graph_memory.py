@@ -123,8 +123,8 @@ class RecallResult:
 class GraphMemoryStore:
     """Graph-structured associative memory backed by SQLite."""
 
-    def __init__(self, workspace: Path, half_life_days: float = 30.0):
-        self.memory_dir = ensure_dir(workspace / "memory")
+    def __init__(self, workspace: Path, half_life_days: float = 30.0, memory_subdir: str = "memory"):
+        self.memory_dir = ensure_dir(workspace / memory_subdir)
         self.db_path = self.memory_dir / "graph.db"
         self.half_life_days = half_life_days
         self._conn: sqlite3.Connection | None = None

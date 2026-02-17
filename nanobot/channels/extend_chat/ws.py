@@ -42,6 +42,7 @@ class HumanlikeWebSocketManager:
         self._conv_ws: dict[str, web.WebSocketResponse] = {}
         self._conv_robot: dict[str, str] = {}
         self._conv_last_activity: dict[str, float] = {}
+        self._conv_system_context: dict[str, dict] = {}
         self._idle_check_task: asyncio.Task | None = None
 
     async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
@@ -72,6 +73,7 @@ class HumanlikeWebSocketManager:
                 self._conv_ws.pop(cid, None)
                 robot_id = self._conv_robot.pop(cid, "default")
                 self._conv_last_activity.pop(cid, None)
+                self._conv_system_context.pop(cid, None)
                 asyncio.create_task(self._archive_conversation(cid, robot_id))
             logger.info(f"Extend-chat WS disconnected (total: {len(self._connections)})")
 
@@ -135,6 +137,11 @@ class HumanlikeWebSocketManager:
         self._conv_robot[conv_id] = robot_id
         self._conv_last_activity[conv_id] = time.time()
 
+        # Store system_context per conversation (updated on each message)
+        sys_ctx = client_msg.system_context
+        if sys_ctx:
+            self._conv_system_context[conv_id] = sys_ctx
+
         # Send ack
         msg_id = uuid.uuid4().hex[:12]
         await self._send(ws, AckResponse(
@@ -157,6 +164,7 @@ class HumanlikeWebSocketManager:
             await orchestrator.dispatch(
                 ws, conv_id, text,
                 send_fn=lambda msg: self._send(ws, msg),
+                system_context=sys_ctx,
             )
 
     def _make_dispatch_fn(
@@ -164,9 +172,11 @@ class HumanlikeWebSocketManager:
     ):
         """Create the dispatch callback for the aggregator."""
         async def dispatch(aggregated_text: str) -> None:
+            sys_ctx = self._conv_system_context.get(conv_id)
             await orchestrator.dispatch(
                 ws, conv_id, aggregated_text,
                 send_fn=lambda msg: self._send(ws, msg),
+                system_context=sys_ctx,
             )
         return dispatch
 
@@ -212,6 +222,13 @@ class HumanlikeWebSocketManager:
         session_key = f"extend-chat:{robot_id}:{conv_id}"
         session = agent.sessions.get_or_create(session_key)
         if session.messages:
+            # Parse memory namespace from conversation_id
+            memory_namespace = None
+            parts = conv_id.split(":")
+            if len(parts) >= 3 and parts[0] == "nukara":
+                memory_namespace = f"{parts[1]}_{parts[2]}"
+
+            prev_store = agent._swap_memory_store(memory_namespace)
             try:
                 await agent._consolidate_memory(session, archive_all=True)
                 session.clear()
@@ -219,6 +236,9 @@ class HumanlikeWebSocketManager:
                 logger.info(f"Archived conversation {conv_id} for robot {robot_id}")
             except Exception:
                 logger.exception(f"Failed to archive {conv_id} for robot {robot_id}")
+            finally:
+                if memory_namespace:
+                    agent._set_memory_store(prev_store)
 
     def start_idle_checker(self) -> None:
         """Start the background idle-conversation checker."""
@@ -240,6 +260,7 @@ class HumanlikeWebSocketManager:
                     robot_id = self._conv_robot.pop(cid, "default")
                     self._conv_ws.pop(cid, None)
                     self._conv_last_activity.pop(cid, None)
+                    self._conv_system_context.pop(cid, None)
                     asyncio.create_task(self._archive_conversation(cid, robot_id))
         except asyncio.CancelledError:
             pass
@@ -261,4 +282,5 @@ class HumanlikeWebSocketManager:
                 pass
         self._connections.clear()
         self._conv_ws.clear()
+        self._conv_system_context.clear()
         self._orchestrators.clear()

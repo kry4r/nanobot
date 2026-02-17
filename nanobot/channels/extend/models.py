@@ -19,6 +19,7 @@ class ClientMessage(BaseModel):
     client_msg_id: str = ""
     content: ContentPayload | None = None
     robot_id: str = "default"
+    system_context: dict | None = None
 
 
 class AckResponse(BaseModel):

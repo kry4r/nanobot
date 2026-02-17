@@ -77,6 +77,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
 
         self.graph_memory = GraphMemoryStore(workspace)
+        self._namespace_stores: dict[str, GraphMemoryStore] = {}
         self.context = ContextBuilder(workspace, memory=self.graph_memory)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -137,6 +138,33 @@ class AgentLoop:
         self.tools.register(CreateMemoryTool(self.graph_memory))
         self.tools.register(UpdateMemoryTool(self.graph_memory))
         self.tools.register(DeleteMemoryTool(self.graph_memory))
+
+    def _get_namespace_store(self, namespace: str) -> GraphMemoryStore:
+        """Get or create a GraphMemoryStore for a memory namespace."""
+        if namespace not in self._namespace_stores:
+            ns_dir = self.workspace / "memory" / namespace
+            ns_dir.mkdir(parents=True, exist_ok=True)
+            self._namespace_stores[namespace] = GraphMemoryStore(self.workspace, memory_subdir=f"memory/{namespace}")
+        return self._namespace_stores[namespace]
+
+    def _swap_memory_store(self, namespace: str | None) -> GraphMemoryStore:
+        """Swap memory tools to use a namespace store. Returns the previous store."""
+        prev = self.graph_memory
+        if not namespace:
+            return prev
+        store = self._get_namespace_store(namespace)
+        self._set_memory_store(store)
+        return prev
+
+    def _set_memory_store(self, store: GraphMemoryStore) -> None:
+        """Point all memory tools and context builder at the given store."""
+        self.graph_memory = store
+        self.context.memory = store
+        for name in ("find_memory_cache", "recall_related", "get_memory_cache",
+                      "create_memory", "update_memory", "delete_memory"):
+            tool = self.tools.get(name)
+            if tool and hasattr(tool, "_store"):
+                tool._store = store
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -259,6 +287,9 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         self.graph_memory.close()
+        for store in self._namespace_stores.values():
+            store.close()
+        self._namespace_stores.clear()
         logger.info("Agent loop stopping")
 
     async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
@@ -588,6 +619,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         recent_window: int = 8,
         summary_threshold: int = 20,
         extra_system_prompt: str | None = None,
+        memory_namespace: str | None = None,
     ) -> AsyncIterator[str]:
         """Process a message with streaming response, using two-layer session context.
 
@@ -598,11 +630,15 @@ Respond with ONLY valid JSON, no markdown fences."""
             chat_id: Chat ID for tool context.
             recent_window: Number of recent conversation turns to keep in full.
             summary_threshold: Old messages to accumulate before generating summary.
+            memory_namespace: If set, use isolated graph memory under this namespace.
 
         Yields:
             Text chunks of the assistant's response.
         """
         await self._connect_mcp()
+
+        # Swap to namespace memory store if requested
+        prev_store = self._swap_memory_store(memory_namespace)
 
         session = self.sessions.get_or_create(session_key)
         self._set_tool_context(channel, chat_id)
@@ -652,6 +688,10 @@ Respond with ONLY valid JSON, no markdown fences."""
             asyncio.create_task(
                 self._summarize_old_messages(session, recent_window)
             )
+
+        # Restore original memory store
+        if memory_namespace:
+            self._set_memory_store(prev_store)
 
     async def _summarize_old_messages(
         self, session: Session, recent_window: int = 8
