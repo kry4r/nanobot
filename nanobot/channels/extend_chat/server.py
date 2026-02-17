@@ -59,6 +59,7 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
         )
         conv_id = body.get("conversation_id", "default")
         robot_id = body.get("robot_id", "default")
+        system_context = body.get("system_context")
 
         if not content.strip():
             return web.json_response({"error": "Empty message"}, status=400)
@@ -69,6 +70,28 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
 
         session_key = f"extend-chat:{robot_id}:{conv_id}"
 
+        # Build extra_system_prompt from system_context
+        extra_prompt = None
+        if isinstance(system_context, dict):
+            ctx_parts = []
+            if name := system_context.get("bot_name"):
+                ctx_parts.append(f"你的名字是{name}。")
+            if persona := system_context.get("persona"):
+                ctx_parts.append(f"角色设定：{persona}")
+            if style := system_context.get("speaking_style"):
+                ctx_parts.append(f"说话风格：{style}")
+            if traits := system_context.get("traits"):
+                if isinstance(traits, list):
+                    ctx_parts.append(f"性格特征：{'、'.join(traits)}")
+            if ctx_parts:
+                extra_prompt = "\n".join(ctx_parts)
+
+        # Parse memory namespace from conversation_id
+        memory_namespace = None
+        parts = conv_id.split(":")
+        if len(parts) >= 3 and parts[0] == "nukara":
+            memory_namespace = f"{parts[1]}_{parts[2]}"
+
         chunks: list[str] = []
         async for chunk in agent.process_streaming(
             content=content,
@@ -77,6 +100,8 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
             chat_id=conv_id,
             recent_window=config.recent_window,
             summary_threshold=config.summary_threshold,
+            extra_system_prompt=extra_prompt,
+            memory_namespace=memory_namespace,
         ):
             chunks.append(chunk)
 

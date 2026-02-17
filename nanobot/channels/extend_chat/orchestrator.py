@@ -90,12 +90,13 @@ class ChatOrchestrator:
         conversation_id: str,
         aggregated_text: str,
         send_fn: Callable[[Any], Awaitable[None]],
+        system_context: dict | None = None,
     ) -> None:
         """Run the full pipeline: LLM stream → split → imperfect → send."""
         lock = self._conv_locks.setdefault(conversation_id, asyncio.Lock())
 
         async with lock:
-            await self._dispatch_locked(ws, conversation_id, aggregated_text, send_fn)
+            await self._dispatch_locked(ws, conversation_id, aggregated_text, send_fn, system_context)
 
     async def _dispatch_locked(
         self,
@@ -103,6 +104,7 @@ class ChatOrchestrator:
         conversation_id: str,
         aggregated_text: str,
         send_fn: Callable[[Any], Awaitable[None]],
+        system_context: dict | None = None,
     ) -> None:
         """Pipeline execution under conversation lock."""
         reply_group_id = uuid.uuid4().hex[:12]
@@ -156,6 +158,29 @@ class ChatOrchestrator:
 
         consumer_task = asyncio.create_task(sentence_consumer())
 
+        # Build extra_system_prompt: merge humanlike prompt + system_context
+        extra_prompt = self._extra_prompt or ""
+        if system_context:
+            ctx_parts = []
+            if name := system_context.get("bot_name"):
+                ctx_parts.append(f"你的名字是{name}。")
+            if persona := system_context.get("persona"):
+                ctx_parts.append(f"角色设定：{persona}")
+            if style := system_context.get("speaking_style"):
+                ctx_parts.append(f"说话风格：{style}")
+            if traits := system_context.get("traits"):
+                if isinstance(traits, list):
+                    ctx_parts.append(f"性格特征：{'、'.join(traits)}")
+            if ctx_parts:
+                ctx_text = "\n".join(ctx_parts)
+                extra_prompt = f"{ctx_text}\n\n{extra_prompt}" if extra_prompt else ctx_text
+
+        # Parse memory namespace from conversation_id (nukara:{userID}:{botID}:{convID})
+        memory_namespace = None
+        parts = conversation_id.split(":")
+        if len(parts) >= 3 and parts[0] == "nukara":
+            memory_namespace = f"{parts[1]}_{parts[2]}"
+
         # Producer: stream from LLM → feed to splitter
         try:
             async for chunk in self._agent.process_streaming(
@@ -165,7 +190,8 @@ class ChatOrchestrator:
                 chat_id=conversation_id,
                 recent_window=self._extend_config.recent_window,
                 summary_threshold=self._extend_config.summary_threshold,
-                extra_system_prompt=self._extra_prompt,
+                extra_system_prompt=extra_prompt or None,
+                memory_namespace=memory_namespace,
             ):
                 await splitter.feed(chunk)
 
