@@ -100,8 +100,7 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
+        self.sessions_dir = ensure_dir(workspace / "sessions")
         self._cache: dict[str, Session] = {}
 
     def _get_session_path(self, key: str) -> Path:

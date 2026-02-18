@@ -20,6 +20,8 @@ def get_data_dir() -> Path:
 def load_config(config_path: Path | None = None) -> Config:
     """
     Load configuration from file or create default.
+    Uses Config() constructor so Pydantic BaseSettings reads env vars.
+    Empty strings in JSON are stripped so env vars can override them.
 
     Args:
         config_path: Optional path to config file. Uses default if not provided.
@@ -34,7 +36,8 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path) as f:
                 data = json.load(f)
             data = _migrate_config(data)
-            return Config.model_validate(data)
+            data = _strip_empty(convert_keys(data))
+            return Config(**data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
@@ -57,6 +60,15 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _strip_empty(data: Any) -> Any:
+    """Remove empty-string leaf values so env vars can override them."""
+    if isinstance(data, dict):
+        return {k: _strip_empty(v) for k, v in data.items() if v != ""}
+    if isinstance(data, list):
+        return [_strip_empty(item) for item in data]
+    return data
 
 
 def _migrate_config(data: dict) -> dict:
