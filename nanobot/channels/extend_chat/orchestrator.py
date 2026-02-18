@@ -75,7 +75,6 @@ class ChatOrchestrator:
         if conversation_id not in self._aggregators:
             self._aggregators[conversation_id] = MessageAggregator(
                 config=self._config.aggregator,
-                conversation_id=conversation_id,
                 dispatch_callback=dispatch_fn,
             )
         return self._aggregators[conversation_id]
@@ -171,6 +170,10 @@ class ChatOrchestrator:
             if traits := system_context.get("traits"):
                 if isinstance(traits, list):
                     ctx_parts.append(f"性格特征：{'、'.join(traits)}")
+            if bg := system_context.get("background"):
+                ctx_parts.append(f"背景故事：{bg}")
+            if gender := system_context.get("gender"):
+                ctx_parts.append(f"性别：{gender}")
             if ctx_parts:
                 ctx_text = "\n".join(ctx_parts)
                 extra_prompt = f"{ctx_text}\n\n{extra_prompt}" if extra_prompt else ctx_text
@@ -222,7 +225,7 @@ class ChatOrchestrator:
     async def cleanup(self) -> None:
         """Cancel all aggregators and eager reply timers."""
         for agg in self._aggregators.values():
-            await agg.cancel()
+            agg.cancel()
         self._aggregators.clear()
         self._conv_locks.clear()
         if self._eager:

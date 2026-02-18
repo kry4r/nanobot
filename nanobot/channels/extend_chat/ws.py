@@ -158,7 +158,7 @@ class HumanlikeWebSocketManager:
                 conv_id,
                 dispatch_fn=self._make_dispatch_fn(ws, conv_id, orchestrator),
             )
-            await aggregator.add_message(text)
+            aggregator.add_message(text)
             await self._send(ws, BotWaitingResponse(conversation_id=conv_id))
         else:
             await orchestrator.dispatch(

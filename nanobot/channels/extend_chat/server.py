@@ -83,6 +83,10 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
             if traits := system_context.get("traits"):
                 if isinstance(traits, list):
                     ctx_parts.append(f"性格特征：{'、'.join(traits)}")
+            if bg := system_context.get("background"):
+                ctx_parts.append(f"背景故事：{bg}")
+            if gender := system_context.get("gender"):
+                ctx_parts.append(f"性别：{gender}")
             if ctx_parts:
                 extra_prompt = "\n".join(ctx_parts)
 
@@ -96,7 +100,7 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
         async for chunk in agent.process_streaming(
             content=content,
             session_key=session_key,
-            channel="extend-chat",
+            channel="http-chat",
             chat_id=conv_id,
             recent_window=config.recent_window,
             summary_threshold=config.summary_threshold,
@@ -106,6 +110,18 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
             chunks.append(chunk)
 
         full_text = "".join(chunks)
+
+        # Extract clean text from LLM output (strip tool calls)
+        import re
+        # Try to extract message content from tool call parameters
+        match = re.search(r'<parameter name=["\'](?:message|content)["\']>(.*?)</parameter>', full_text, re.DOTALL)
+        if match:
+            full_text = match.group(1).strip()
+        else:
+            # Fallback: strip entire tool call blocks
+            full_text = re.sub(r'<[^>]+:tool_call>.*?</[^>]+:tool_call>', '', full_text, flags=re.DOTALL)
+            full_text = full_text.strip()
+
         return web.json_response({
             "conversation_id": conv_id,
             "content": {"type": "text", "text": full_text},
