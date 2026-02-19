@@ -3,8 +3,10 @@
 Two-phase recall: anchor + time-chain backtracking, then spreading activation.
 """
 
+import heapq
 import sqlite3
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -18,13 +20,16 @@ from nanobot.utils.helpers import ensure_dir
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id         TEXT PRIMARY KEY,
-    type       TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    keywords   TEXT NOT NULL DEFAULT '',
-    weight     REAL NOT NULL DEFAULT 1.0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    id           TEXT PRIMARY KEY,
+    type         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    body         TEXT NOT NULL DEFAULT '',
+    keywords     TEXT NOT NULL DEFAULT '',
+    weight       REAL NOT NULL DEFAULT 1.0,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    community_id INTEGER DEFAULT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -44,8 +49,13 @@ CREATE TABLE IF NOT EXISTS keyword_map (
 
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation, source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_source_weight ON edges(source_id, weight DESC);
+CREATE INDEX IF NOT EXISTS idx_edges_target_weight ON edges(target_id, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_nodes_created ON nodes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+CREATE INDEX IF NOT EXISTS idx_nodes_type_created ON nodes(type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_nodes_type_weight ON nodes(type, weight DESC);
 CREATE INDEX IF NOT EXISTS idx_keyword_map_kw ON keyword_map(keyword);
 """
 
@@ -73,6 +83,34 @@ CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.rowid, new.id, new.content);
 END;
 """
+
+
+# ── LRU Cache ────────────────────────────────────────────────────────────────
+
+class _NodeCache:
+    """Simple LRU cache using OrderedDict."""
+
+    def __init__(self, capacity: int = 5000):
+        self._data: OrderedDict[str, dict] = OrderedDict()
+        self._capacity = capacity
+
+    def get(self, key: str) -> dict | None:
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        return None
+
+    def put(self, key: str, value: dict) -> None:
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self._capacity:
+            self._data.popitem(last=False)
+
+    def invalidate(self, key: str) -> None:
+        self._data.pop(key, None)
+
+    def clear(self) -> None:
+        self._data.clear()
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -106,6 +144,9 @@ class RecallResult:
             for frame in self.timeline:
                 ts = frame.event.get("created_at", "?")[:16]
                 parts.append(f"[{ts}] {frame.event['content']}")
+                body = frame.event.get("body", "")
+                if body:
+                    parts.append(f"  {body[:300]}")
                 if frame.context:
                     ctx = ", ".join(n["content"] for n in frame.context[:8])
                     parts.append(f"  ├── 关联：{ctx}")
@@ -128,6 +169,7 @@ class GraphMemoryStore:
         self.db_path = self.memory_dir / "graph.db"
         self.half_life_days = half_life_days
         self._conn: sqlite3.Connection | None = None
+        self._cache = _NodeCache(5000)
         self._ensure_db()
 
     # ── Connection ────────────────────────────────────────
@@ -138,20 +180,35 @@ class GraphMemoryStore:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA cache_size=-64000")
+            self._conn.execute("PRAGMA mmap_size=268435456")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA wal_autocheckpoint=0")
         return self._conn
 
     def _ensure_db(self) -> None:
         conn = self._get_conn()
         conn.executescript(_SCHEMA_SQL)
+        # Migrate: add new columns if missing
+        for col, ddl in [
+            ("body", "ALTER TABLE nodes ADD COLUMN body TEXT NOT NULL DEFAULT ''"),
+            ("access_count", "ALTER TABLE nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
+            ("community_id", "ALTER TABLE nodes ADD COLUMN community_id INTEGER DEFAULT NULL"),
+        ]:
+            try:
+                conn.execute(f"SELECT {col} FROM nodes LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute(ddl)
         try:
             conn.executescript(_FTS_SQL)
         except sqlite3.OperationalError as e:
-            # FTS5 may not be available on all builds
             logger.warning(f"FTS5 setup failed (content fallback disabled): {e}")
         conn.commit()
 
     def close(self) -> None:
         if self._conn:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.close()
             self._conn = None
 
@@ -185,6 +242,7 @@ class GraphMemoryStore:
         keywords: list[str],
         node_type: str = "event",
         linked_to: list[str] | None = None,
+        body: str = "",
     ) -> str:
         """Create a node. Auto-manages keyword_map and concept promotion."""
         conn = self._get_conn()
@@ -196,21 +254,19 @@ class GraphMemoryStore:
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
-                "INSERT INTO nodes (id, type, content, keywords, weight, created_at, updated_at) "
-                "VALUES (?,?,?,?,1.0,?,?)",
-                (node_id, node_type, content, kw_str, now, now),
+                "INSERT INTO nodes (id, type, content, body, keywords, weight, access_count, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,1.0,0,?,?)",
+                (node_id, node_type, content, body, kw_str, now, now),
             )
 
-            # Write keyword_map entries
-            for kw in norm_kws:
-                conn.execute(
-                    "INSERT OR IGNORE INTO keyword_map (keyword, node_id) VALUES (?,?)",
-                    (kw, node_id),
-                )
+            # Write keyword_map entries (batch)
+            conn.executemany(
+                "INSERT OR IGNORE INTO keyword_map (keyword, node_id) VALUES (?,?)",
+                [(kw, node_id) for kw in norm_kws],
+            )
 
-            # Check concept promotion for each keyword
-            for kw in norm_kws:
-                self._maybe_promote_concept(conn, kw, now)
+            # Batch concept promotion: 1 SELECT + 1 executemany instead of 3×N queries
+            self._batch_promote_concepts(conn, norm_kws, now, node_id)
 
             # Explicit links
             if linked_to:
@@ -231,26 +287,31 @@ class GraphMemoryStore:
             conn.execute("ROLLBACK")
             raise
 
+        self._cache.invalidate(node_id)
         logger.debug(f"Created {node_type} node [{node_id}] keywords={norm_kws}")
         return node_id
 
     def _maybe_promote_concept(
-        self, conn: sqlite3.Connection, keyword: str, now: str
+        self, conn: sqlite3.Connection, keyword: str, now: str, current_node_id: str
     ) -> None:
         """If keyword is referenced by ≥2 nodes and no concept exists, create one."""
-        # Count references in keyword_map
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM keyword_map WHERE keyword=?", (keyword,)
         ).fetchone()
         if row["cnt"] < 2:
             return
 
-        # Check if concept already exists
         existing = conn.execute(
             "SELECT id FROM nodes WHERE type='concept' AND content=?", (keyword,)
         ).fetchone()
         if existing:
             concept_id = existing["id"]
+            # Concept exists — only link the current node
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, weight, created_at) "
+                "VALUES (?,?,'about',1.0,?)",
+                (current_node_id, concept_id, now),
+            )
         else:
             concept_id = self._gen_id()
             conn.execute(
@@ -259,31 +320,61 @@ class GraphMemoryStore:
                 (concept_id, "concept", keyword, keyword, now, now),
             )
             logger.debug(f"Promoted keyword '{keyword}' to concept [{concept_id}]")
+            # New concept — link all existing nodes
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, weight, created_at) "
+                "SELECT km.node_id, ?, 'about', 1.0, ? "
+                "FROM keyword_map km WHERE km.keyword = ? AND km.node_id != ?",
+                (concept_id, now, keyword, concept_id),
+            )
 
-        # Link all referencing nodes to the concept
-        referencing = conn.execute(
-            "SELECT node_id FROM keyword_map WHERE keyword=?", (keyword,)
+    def _batch_promote_concepts(
+        self, conn: sqlite3.Connection, keywords: list[str], now: str, current_node_id: str
+    ) -> None:
+        """Batch concept promotion: 1 SELECT + 1 executemany for existing concepts."""
+        if not keywords:
+            return
+        placeholders = ",".join("?" for _ in keywords)
+        # Batch find existing concepts
+        rows = conn.execute(
+            f"SELECT id, content FROM nodes WHERE type='concept' AND content IN ({placeholders})",
+            keywords,
         ).fetchall()
-        for ref in referencing:
-            if ref["node_id"] != concept_id:
-                conn.execute(
-                    "INSERT OR IGNORE INTO edges "
-                    "(source_id, target_id, relation, weight, created_at) "
-                    "VALUES (?,?,'about',1.0,?)",
-                    (ref["node_id"], concept_id, now),
-                )
+        concept_map = {row["content"]: row["id"] for row in rows}
+
+        # Batch link current node to existing concepts
+        edges = [(current_node_id, concept_map[kw], now) for kw in keywords if kw in concept_map]
+        if edges:
+            conn.executemany(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, weight, created_at) "
+                "VALUES (?,?,'about',1.0,?)",
+                edges,
+            )
+
+        # For keywords without concepts, check if promotion needed (rare in steady state)
+        for kw in keywords:
+            if kw not in concept_map:
+                self._maybe_promote_concept(conn, kw, now, current_node_id)
 
     def get_node(self, node_id: str) -> dict[str, Any] | None:
+        cached = self._cache.get(node_id)
+        if cached is not None:
+            return cached
         row = self._get_conn().execute(
             "SELECT * FROM nodes WHERE id=?", (node_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if row:
+            node = dict(row)
+            self._cache.put(node_id, node)
+            return node
+        return None
 
     def update_node(
         self,
         node_id: str,
         content: str | None = None,
         keywords: list[str] | None = None,
+        body: str | None = None,
     ) -> bool:
         conn = self._get_conn()
         node = self.get_node(node_id)
@@ -292,6 +383,7 @@ class GraphMemoryStore:
 
         now = self._now()
         new_content = content if content is not None else node["content"]
+        new_body = body if body is not None else node.get("body", "")
         new_kws = (
             [self._normalize_keyword(k) for k in keywords if k.strip()]
             if keywords is not None
@@ -302,8 +394,8 @@ class GraphMemoryStore:
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
-                "UPDATE nodes SET content=?, keywords=?, updated_at=? WHERE id=?",
-                (new_content, new_kw_str, now, node_id),
+                "UPDATE nodes SET content=?, body=?, keywords=?, updated_at=? WHERE id=?",
+                (new_content, new_body, new_kw_str, now, node_id),
             )
 
             if new_kws is not None:
@@ -319,19 +411,21 @@ class GraphMemoryStore:
                         "INSERT OR IGNORE INTO keyword_map (keyword, node_id) VALUES (?,?)",
                         (kw, node_id),
                     )
-                    self._maybe_promote_concept(conn, kw, now)
+                self._batch_promote_concepts(conn, new_kws, now, node_id)
 
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
 
+        self._cache.invalidate(node_id)
         return True
 
     def delete_node(self, node_id: str) -> bool:
         conn = self._get_conn()
         cursor = conn.execute("DELETE FROM nodes WHERE id=?", (node_id,))
         conn.commit()
+        self._cache.invalidate(node_id)
         return cursor.rowcount > 0
 
     # ── Search ────────────────────────────────────────────
@@ -371,7 +465,8 @@ class GraphMemoryStore:
 
     # ── Phase 1: Recall Chain ─────────────────────────────
 
-    def recall_chain(self, query: str, max_events: int = 10) -> RecallResult:
+    def recall_chain(self, query: str, max_events: int = 10,
+                     time_start: str | None = None, time_end: str | None = None) -> RecallResult:
         """
         Phase 1: Anchor on concepts/entities, then walk their event timeline.
         Each event gets lateral context (neighbors excluding anchors).
@@ -397,18 +492,23 @@ class GraphMemoryStore:
             anchor_ids = [a["id"] for a in anchors]
 
             # Step 2: Find events linked to anchors via 'about' edges, time DESC
+            # Subquery forces SQLite to use edges index first, then lookup nodes by PK
             placeholders = ",".join("?" for _ in anchor_ids)
-            events_rows = conn.execute(
-                f"""SELECT DISTINCT n.*
-                    FROM edges e
-                    JOIN nodes n ON n.id = e.source_id
-                    WHERE e.target_id IN ({placeholders})
-                      AND e.relation = 'about'
-                      AND n.type = 'event'
-                    ORDER BY n.created_at DESC
-                    LIMIT ?""",
-                (*anchor_ids, max_events),
-            ).fetchall()
+            sql = f"""SELECT n.* FROM nodes n
+                    WHERE n.id IN (
+                        SELECT e.source_id FROM edges e
+                        WHERE e.target_id IN ({placeholders}) AND e.relation = 'about'
+                    ) AND n.type = 'event'"""
+            params: list[Any] = list(anchor_ids)
+            if time_start:
+                sql += " AND n.created_at >= ?"
+                params.append(time_start)
+            if time_end:
+                sql += " AND n.created_at <= ?"
+                params.append(time_end)
+            sql += " ORDER BY n.created_at DESC LIMIT ?"
+            params.append(max_events)
+            events_rows = conn.execute(sql, params).fetchall()
             events = [dict(r) for r in events_rows]
 
             # Merge any direct event hits not already found
@@ -417,11 +517,18 @@ class GraphMemoryStore:
                 if de["id"] not in event_ids:
                     events.append(de)
 
-        # Step 3: For each event, get lateral context (neighbors excluding anchors)
+        # Step 3: Batch fetch all neighbors (eliminates N+1)
         anchor_id_set = {a["id"] for a in result.anchors}
-        for event in events[:max_events]:
-            neighbors = self.get_neighbors(event["id"])
-            context = [n for n in neighbors if n["id"] not in anchor_id_set]
+        event_slice = events[:max_events]
+        event_ids_list = [e["id"] for e in event_slice]
+        neighbors_map = self._batch_get_neighbors(event_ids_list) if event_ids_list else {}
+
+        for event in event_slice:
+            edges = neighbors_map.get(event["id"], [])
+            # Top-8 neighbors by edge weight
+            edges.sort(key=lambda e: -e["weight"])
+            neighbor_ids = [e["neighbor_id"] for e in edges[:8] if e["neighbor_id"] not in anchor_id_set]
+            context = self.get_chain(neighbor_ids) if neighbor_ids else []
             result.timeline.append(RecallFrame(
                 event=event,
                 context=context,
@@ -429,9 +536,8 @@ class GraphMemoryStore:
             ))
 
         # Bump weight on hit nodes
-        hit_ids = [e["id"] for e in events[:max_events]]
-        if hit_ids:
-            self._bump_weights(hit_ids)
+        if event_ids_list:
+            self._bump_weights(event_ids_list)
 
         return result
 
@@ -448,69 +554,56 @@ class GraphMemoryStore:
         max_nodes: int = 30,
     ) -> list[tuple[dict, float]]:
         """
-        Weighted spreading activation from seed nodes.
+        Priority-queue spreading activation from seed nodes.
+        Uses a max-heap instead of BFS for bounded exploration.
         Returns (node_dict, activation_score) sorted by score DESC.
         """
         if not seed_ids:
             return []
 
-        activation: dict[str, float] = {}
-        if seed_weights:
-            activation.update(seed_weights)
-        else:
-            for sid in seed_ids:
-                activation[sid] = 1.0
-
         seed_set = set(seed_ids)
-        current_layer = set(seed_ids)
+        visited: set[str] = set(seed_ids)
+        results: list[tuple[str, float]] = []
 
-        for _depth in range(max_depth):
-            if not current_layer:
+        # Max-heap via negative scores (heapq is min-heap)
+        heap: list[tuple[float, str]] = []
+        for sid in seed_ids:
+            score = (seed_weights or {}).get(sid, 1.0)
+            heapq.heappush(heap, (-score, sid))
+
+        while heap and len(results) < max_nodes:
+            neg_score, node_id = heapq.heappop(heap)
+            score = -neg_score
+            if score < min_activation:
                 break
 
-            neighbors_map = self._batch_get_neighbors(list(current_layer))
-            next_layer: set[str] = set()
+            if node_id not in seed_set:
+                results.append((node_id, score))
 
-            for source_id in current_layer:
-                source_act = activation.get(source_id, 0)
-                if source_act < min_activation:
+            # Expand neighbors
+            neighbors_map = self._batch_get_neighbors([node_id])
+            edges = neighbors_map.get(node_id, [])
+            scored_edges = sorted(
+                ((e, e["weight"] * self._time_decay(e["created_at"])) for e in edges),
+                key=lambda x: -x[1],
+            )[:top_k]
+
+            for edge, edge_score in scored_edges:
+                target_id = edge["neighbor_id"]
+                if target_id in visited:
                     continue
+                visited.add(target_id)
+                propagated = score * decay * edge_score
+                if propagated >= min_activation:
+                    heapq.heappush(heap, (-propagated, target_id))
 
-                edges = neighbors_map.get(source_id, [])
-                # Top-K pruning: sort by edge_weight * time_decay, take top_k
-                scored_edges = []
-                for edge in edges:
-                    td = self._time_decay(edge["created_at"])
-                    scored_edges.append((edge, edge["weight"] * td))
-                scored_edges.sort(key=lambda x: -x[1])
-
-                for edge, edge_score in scored_edges[:top_k]:
-                    target_id = edge["neighbor_id"]
-                    propagated = source_act * decay * edge_score
-                    if propagated < min_activation:
-                        continue
-                    # Accumulate (multi-path convergence)
-                    activation[target_id] = activation.get(target_id, 0) + propagated
-                    next_layer.add(target_id)
-
-            current_layer = next_layer - seed_set
-
-        # Fetch node details for non-seed activated nodes
-        result_ids = [
-            (nid, score)
-            for nid, score in activation.items()
-            if nid not in seed_set and score >= min_activation
-        ]
-        result_ids.sort(key=lambda x: -x[1])
-        result_ids = result_ids[:max_nodes]
-
-        if not result_ids:
+        if not results:
             return []
 
-        nodes_map = {n["id"]: n for n in self.get_chain([r[0] for r in result_ids])}
+        nodes_map = {n["id"]: n for n in self.get_chain([r[0] for r in results])}
         return [
-            (nodes_map[nid], score)
-            for nid, score in result_ids
+            (nodes_map[nid], s)
+            for nid, s in results
             if nid in nodes_map
         ]
 
@@ -579,12 +672,13 @@ class GraphMemoryStore:
     # ── Weight management ─────────────────────────────────
 
     def _bump_weights(self, node_ids: list[str], amount: float = 0.1) -> None:
-        """Bump weight for accessed nodes."""
+        """Bump weight and access_count for accessed nodes."""
         conn = self._get_conn()
         now = self._now()
         placeholders = ",".join("?" for _ in node_ids)
         conn.execute(
-            f"UPDATE nodes SET weight = weight + ?, updated_at = ? WHERE id IN ({placeholders})",
+            f"UPDATE nodes SET weight = weight + ?, access_count = access_count + 1, updated_at = ? "
+            f"WHERE id IN ({placeholders})",
             (amount, now, *node_ids),
         )
         conn.commit()
@@ -637,3 +731,56 @@ class GraphMemoryStore:
         conn.commit()
         logger.debug(f"GC: removed {len(ids)} cold concept nodes")
         return len(ids)
+
+    # ── Auto-link & Community ─────────────────────────────
+
+    def auto_link_node(self, node_id: str, max_links: int = 3) -> list[str]:
+        """Auto-link a node to related nodes via keyword overlap (≥2 shared). Single-query."""
+        node = self.get_node(node_id)
+        if not node:
+            return []
+        node_kws = [k for k in node["keywords"].split(",") if k]
+        if len(node_kws) < 2:
+            return []
+
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in node_kws)
+        scored = conn.execute(
+            f"""SELECT km.node_id, COUNT(*) as shared_count
+                FROM keyword_map km
+                WHERE km.keyword IN ({placeholders}) AND km.node_id != ?
+                GROUP BY km.node_id
+                HAVING shared_count >= 2
+                ORDER BY shared_count DESC
+                LIMIT ?""",
+            (*node_kws, node_id, max_links),
+        ).fetchall()
+
+        now = self._now()
+        linked = []
+        for row in scored:
+            w = min(row["shared_count"] / len(node_kws), 1.0)
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id,target_id,relation,weight,created_at) "
+                "VALUES (?,?,'related',?,?)",
+                (node_id, row["node_id"], w, now),
+            )
+            linked.append(row["node_id"])
+        if linked:
+            conn.commit()
+        return linked
+
+    def update_community_id(self, node_id: str, community_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE nodes SET community_id=? WHERE id=?", (community_id, node_id))
+        conn.commit()
+
+    def get_all_nodes(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._get_conn().execute(
+            "SELECT * FROM nodes ORDER BY created_at DESC"
+        ).fetchall()]
+
+    def get_all_edges(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._get_conn().execute(
+            "SELECT source_id, target_id, relation, weight FROM edges"
+        ).fetchall()]

@@ -174,6 +174,10 @@ class ChatOrchestrator:
                 ctx_parts.append(f"背景故事：{bg}")
             if gender := system_context.get("gender"):
                 ctx_parts.append(f"性别：{gender}")
+            if directives := system_context.get("user_directives"):
+                if isinstance(directives, list) and directives:
+                    ctx_parts.append("【用户指令】以下是用户明确要求你遵守的行为规则，必须严格执行：\n" +
+                                     "\n".join(f"- {d}" for d in directives))
             if ctx_parts:
                 ctx_text = "\n".join(ctx_parts)
                 extra_prompt = f"{ctx_text}\n\n{extra_prompt}" if extra_prompt else ctx_text
@@ -183,6 +187,14 @@ class ChatOrchestrator:
         parts = conversation_id.split(":")
         if len(parts) >= 3 and parts[0] == "nukara":
             memory_namespace = f"{parts[1]}_{parts[2]}"
+
+        # Pre-retrieve memories and inject into system prompt
+        if memory_namespace:
+            from nanobot.channels.extend_chat.memory_retriever import retrieve_memory_context
+            mem_ctx = retrieve_memory_context(self._agent, memory_namespace, aggregated_text)
+            if mem_ctx:
+                mem_prefix = f"【你的记忆】以下是你已经记住的关于用户的信息，回复时直接引用，不要再用记忆工具搜索这些已知信息：\n{mem_ctx}"
+                extra_prompt = f"{mem_prefix}\n\n{extra_prompt}" if extra_prompt else mem_prefix
 
         # Producer: stream from LLM → feed to splitter
         try:
@@ -221,6 +233,12 @@ class ChatOrchestrator:
         # Notify eager reply
         if self._eager:
             self._eager.on_dispatch_end(conversation_id)
+
+    def cleanup_conversation(self, conversation_id: str) -> None:
+        """Remove per-conversation state to prevent memory leaks."""
+        if agg := self._aggregators.pop(conversation_id, None):
+            agg.cancel()
+        self._conv_locks.pop(conversation_id, None)
 
     async def cleanup(self) -> None:
         """Cancel all aggregators and eager reply timers."""

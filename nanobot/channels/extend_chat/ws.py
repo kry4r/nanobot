@@ -74,6 +74,9 @@ class HumanlikeWebSocketManager:
                 robot_id = self._conv_robot.pop(cid, "default")
                 self._conv_last_activity.pop(cid, None)
                 self._conv_system_context.pop(cid, None)
+                orch = self._orchestrators.get(robot_id)
+                if orch:
+                    orch.cleanup_conversation(cid)
                 asyncio.create_task(self._archive_conversation(cid, robot_id))
             logger.info(f"Extend-chat WS disconnected (total: {len(self._connections)})")
 
@@ -261,6 +264,9 @@ class HumanlikeWebSocketManager:
                     self._conv_ws.pop(cid, None)
                     self._conv_last_activity.pop(cid, None)
                     self._conv_system_context.pop(cid, None)
+                    orch = self._orchestrators.get(robot_id)
+                    if orch:
+                        orch.cleanup_conversation(cid)
                     asyncio.create_task(self._archive_conversation(cid, robot_id))
         except asyncio.CancelledError:
             pass

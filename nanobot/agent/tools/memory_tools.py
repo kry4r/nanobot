@@ -40,13 +40,26 @@ class FindMemoryCacheTool(Tool):
                     "minimum": 1,
                     "maximum": 30,
                 },
+                "time_start": {
+                    "type": "string",
+                    "description": "ISO date string for time range start",
+                },
+                "time_end": {
+                    "type": "string",
+                    "description": "ISO date string for time range end",
+                },
             },
             "required": ["query"],
         }
 
-    async def execute(self, query: str, max_events: int = 10, **kwargs: Any) -> str:
+    async def execute(self, query: str, max_events: int = 10,
+                      time_start: str | None = None, time_end: str | None = None,
+                      **kwargs: Any) -> str:
         try:
-            result = self._store.recall_chain(query, max_events=max_events)
+            result = self._store.recall_chain(
+                query, max_events=max_events,
+                time_start=time_start, time_end=time_end,
+            )
             return result.format_for_llm()
         except Exception as e:
             return f"Error searching memory: {e}"
@@ -183,12 +196,14 @@ class GetMemoryCacheTool(Tool):
                 neighbor_summary = ", ".join(
                     f"{n['content']}({n['relation']})" for n in neighbors[:8]
                 )
+                body = node.get("body", "")
                 parts.append(
                     f"## [{node['id']}] {node['type']} — {node['created_at'][:16]}\n"
                     f"{node['content']}\n"
                     f"Keywords: {node['keywords']}\n"
                     f"Weight: {node['weight']:.1f}\n"
-                    f"Connected to: {neighbor_summary or 'none'}"
+                    + (f"\n{body}\n" if body else "")
+                    + f"Connected to: {neighbor_summary or 'none'}"
                 )
             return "\n\n".join(parts)
         except Exception as e:
@@ -221,7 +236,11 @@ class CreateMemoryTool(Tool):
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "Memory content description",
+                    "description": "Short title/summary of the memory",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Detailed content: code changes, project analysis, file summaries, etc.",
                 },
                 "keywords": {
                     "type": "array",
@@ -247,6 +266,7 @@ class CreateMemoryTool(Tool):
         content: str,
         keywords: list[str],
         type: str = "event",
+        body: str = "",
         linked_to: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
@@ -256,8 +276,13 @@ class CreateMemoryTool(Tool):
                 keywords=keywords,
                 node_type=type,
                 linked_to=linked_to,
+                body=body,
             )
-            return f"Created {type} node [{node_id}] with keywords: {', '.join(keywords)}"
+            auto_linked = self._store.auto_link_node(node_id)
+            msg = f"Created {type} node [{node_id}] with keywords: {', '.join(keywords)}"
+            if auto_linked:
+                msg += f"\nAuto-linked to: {', '.join(auto_linked)}"
+            return msg
         except Exception as e:
             return f"Error creating memory: {e}"
 
@@ -287,7 +312,11 @@ class UpdateMemoryTool(Tool):
                 },
                 "content": {
                     "type": "string",
-                    "description": "New content (omit to keep existing)",
+                    "description": "New title/summary (omit to keep existing)",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "New detailed content (omit to keep existing)",
                 },
                 "keywords": {
                     "type": "array",
@@ -302,11 +331,12 @@ class UpdateMemoryTool(Tool):
         self,
         node_id: str,
         content: str | None = None,
+        body: str | None = None,
         keywords: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
         try:
-            if self._store.update_node(node_id, content=content, keywords=keywords):
+            if self._store.update_node(node_id, content=content, keywords=keywords, body=body):
                 return f"Updated node [{node_id}]"
             return f"Node [{node_id}] not found"
         except Exception as e:
@@ -347,3 +377,104 @@ class DeleteMemoryTool(Tool):
             return f"Node [{node_id}] not found"
         except Exception as e:
             return f"Error deleting memory: {e}"
+
+
+class ConsolidateMemoriesTool(Tool):
+    """Merge highly similar memories to reduce graph bloat."""
+
+    def __init__(self, store: GraphMemoryStore):
+        self._store = store
+
+    @property
+    def name(self) -> str:
+        return "consolidate_memories"
+
+    @property
+    def description(self) -> str:
+        return "Merge highly similar memories (Jaccard > 0.7) to reduce graph bloat."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> str:
+        try:
+            from nanobot.agent.enhancements import consolidate_memories
+            merged = consolidate_memories(self._store)
+            if not merged:
+                return "No memories to consolidate"
+            return f"Consolidated {len(merged)} pairs:\n" + "\n".join(merged)
+        except Exception as e:
+            return f"Error consolidating: {e}"
+
+
+class CheckContradictionsTool(Tool):
+    """Detect potential contradictions between a memory and related nodes."""
+
+    def __init__(self, store: GraphMemoryStore):
+        self._store = store
+
+    @property
+    def name(self) -> str:
+        return "check_contradictions"
+
+    @property
+    def description(self) -> str:
+        return "Detect potential contradictions between a memory and related nodes."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "Node ID to check"},
+            },
+            "required": ["node_id"],
+        }
+
+    async def execute(self, node_id: str, **kwargs: Any) -> str:
+        try:
+            from nanobot.agent.enhancements import detect_contradictions
+            results = detect_contradictions(self._store, node_id)
+            if not results:
+                return "No contradictions detected"
+            lines = [
+                f"{r['nodeA']} ↔ {r['nodeB']} [{','.join(r['sharedKeywords'])}]: {r['hint']}"
+                for r in results
+            ]
+            return f"Potential contradictions:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error checking contradictions: {e}"
+
+
+class DetectCommunitiesTool(Tool):
+    """Run label propagation to identify memory clusters."""
+
+    def __init__(self, store: GraphMemoryStore):
+        self._store = store
+
+    @property
+    def name(self) -> str:
+        return "detect_communities"
+
+    @property
+    def description(self) -> str:
+        return "Run label propagation to identify memory clusters/communities."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> str:
+        try:
+            from nanobot.agent.enhancements import detect_communities
+            communities = detect_communities(self._store)
+            lines = [
+                f"Community {cid}: {len(nids)} nodes [{', '.join(nids[:5])}{'...' if len(nids) > 5 else ''}]"
+                for cid, nids in communities.items() if len(nids) > 1
+            ]
+            if not lines:
+                return "No multi-node communities found"
+            return f"Found {len(lines)} communities:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error detecting communities: {e}"

@@ -30,6 +30,7 @@ def create_app(
 
     app.router.add_get("/health", _health_handler)
     app.router.add_post("/chat", _make_chat_handler(config, robot_manager))
+    app.router.add_post("/memory/retrieve", _make_memory_retrieve_handler(config, robot_manager))
     app.router.add_get("/ws/chat", ws_manager.handle_ws)
 
     return app, ws_manager
@@ -87,6 +88,10 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
                 ctx_parts.append(f"背景故事：{bg}")
             if gender := system_context.get("gender"):
                 ctx_parts.append(f"性别：{gender}")
+            if directives := system_context.get("user_directives"):
+                if isinstance(directives, list) and directives:
+                    ctx_parts.append("【用户指令】以下是用户明确要求你遵守的行为规则，必须严格执行：\n" +
+                                     "\n".join(f"- {d}" for d in directives))
             if ctx_parts:
                 extra_prompt = "\n".join(ctx_parts)
 
@@ -95,6 +100,14 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
         parts = conv_id.split(":")
         if len(parts) >= 3 and parts[0] == "nukara":
             memory_namespace = f"{parts[1]}_{parts[2]}"
+
+        # Pre-retrieve memories and inject into system prompt
+        if memory_namespace:
+            from nanobot.channels.extend_chat.memory_retriever import retrieve_memory_context
+            mem_ctx = retrieve_memory_context(agent, memory_namespace, content)
+            if mem_ctx:
+                mem_prefix = f"【你的记忆】以下是你已经记住的关于用户的信息，回复时直接引用，不要再用记忆工具搜索这些已知信息：\n{mem_ctx}"
+                extra_prompt = f"{mem_prefix}\n\n{extra_prompt}" if extra_prompt else mem_prefix
 
         chunks: list[str] = []
         async for chunk in agent.process_streaming(
@@ -126,5 +139,43 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
             "conversation_id": conv_id,
             "content": {"type": "text", "text": full_text},
         })
+
+    return handler
+
+
+def _make_memory_retrieve_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"):
+    """POST /memory/retrieve — standalone memory retrieval for Go backend."""
+
+    async def handler(request: web.Request) -> web.Response:
+        if not verify_token(request, config):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        conv_id = body.get("conversation_id", "")
+        query = body.get("query", "")
+        max_events = body.get("max_events", 5)
+        robot_id = body.get("robot_id", "default")
+
+        if not query.strip():
+            return web.json_response({"error": "Empty query"}, status=400)
+
+        # Parse namespace from conversation_id
+        parts = conv_id.split(":")
+        if len(parts) < 3 or parts[0] != "nukara":
+            return web.json_response({"error": "Invalid conversation_id format"}, status=400)
+        namespace = f"{parts[1]}_{parts[2]}"
+
+        agent = robot_manager.get_or_default(robot_id)
+        if not agent:
+            return web.json_response({"error": f"Unknown robot: {robot_id}"}, status=400)
+
+        from nanobot.channels.extend_chat.memory_retriever import retrieve_memory_context
+        mem_ctx = retrieve_memory_context(agent, namespace, query, max_events=max_events)
+
+        return web.json_response({"memory_context": mem_ctx or ""})
 
     return handler
