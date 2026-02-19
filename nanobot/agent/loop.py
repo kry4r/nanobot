@@ -15,8 +15,11 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.memory_tools import (
+    CheckContradictionsTool,
+    ConsolidateMemoriesTool,
     CreateMemoryTool,
     DeleteMemoryTool,
+    DetectCommunitiesTool,
     FindMemoryCacheTool,
     GetMemoryCacheTool,
     RecallRelatedTool,
@@ -138,6 +141,9 @@ class AgentLoop:
         self.tools.register(CreateMemoryTool(self.graph_memory))
         self.tools.register(UpdateMemoryTool(self.graph_memory))
         self.tools.register(DeleteMemoryTool(self.graph_memory))
+        self.tools.register(ConsolidateMemoriesTool(self.graph_memory))
+        self.tools.register(CheckContradictionsTool(self.graph_memory))
+        self.tools.register(DetectCommunitiesTool(self.graph_memory))
 
     def _get_namespace_store(self, namespace: str) -> GraphMemoryStore:
         """Get or create a GraphMemoryStore for a memory namespace."""
@@ -161,7 +167,8 @@ class AgentLoop:
         self.graph_memory = store
         self.context.memory = store
         for name in ("find_memory_cache", "recall_related", "get_memory_cache",
-                      "create_memory", "update_memory", "delete_memory"):
+                      "create_memory", "update_memory", "delete_memory",
+                      "consolidate_memories", "check_contradictions", "detect_communities"):
             tool = self.tools.get(name)
             if tool and hasattr(tool, "_store"):
                 tool._store = store
