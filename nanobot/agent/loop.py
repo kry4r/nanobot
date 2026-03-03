@@ -9,7 +9,7 @@ import weakref
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import json_repair
 from loguru import logger
@@ -336,6 +336,57 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
+            if msg.content.strip().lower() == "/stop":
+                await self._handle_stop(msg)
+            else:
+                task = asyncio.create_task(self._dispatch(msg))
+                self._active_tasks.setdefault(msg.session_key, []).append(task)
+                task.add_done_callback(
+                    lambda t, k=msg.session_key: (
+                        self._active_tasks.get(k, []).remove(t)
+                        if t in self._active_tasks.get(k, [])
+                        else None
+                    )
+                )
+
+    async def _handle_stop(self, msg: InboundMessage) -> None:
+        """Cancel all active tasks and subagents for the session."""
+        tasks = self._active_tasks.pop(msg.session_key, [])
+        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        total = cancelled + sub_cancelled
+        content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _dispatch(self, msg: InboundMessage) -> None:
+        """Process a message under the global lock."""
+        async with self._processing_lock:
+            try:
+                response = await self._process_message(msg)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+                elif msg.channel == "cli":
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata=msg.metadata or {},
+                    ))
+            except asyncio.CancelledError:
+                logger.info("Task cancelled for session {}", msg.session_key)
+                raise
+            except Exception:
+                logger.exception("Error processing message for session {}", msg.session_key)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error.",
+                ))
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -354,7 +405,12 @@ class AgentLoop:
         self._namespace_stores.clear()
         logger.info("Agent loop stopping")
 
-    async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
 
@@ -451,7 +507,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, _ = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -499,7 +555,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _, _ = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."
@@ -514,7 +570,7 @@ class AgentLoop:
             content=final_content
         )
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
+    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Consolidate old messages into graph memory.
 
         Args:
@@ -529,16 +585,16 @@ class AgentLoop:
             keep_count = self.memory_window // 2
             if len(session.messages) <= keep_count:
                 logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
-                return
+                return True
 
             messages_to_process = len(session.messages) - session.last_consolidated
             if messages_to_process <= 0:
                 logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
-                return
+                return True
 
             old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
-                return
+                return True
             logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
 
         lines = []
@@ -577,13 +633,13 @@ Respond with ONLY valid JSON, no markdown fences."""
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
-                return
+                return False
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             result = json_repair.loads(text)
             if not isinstance(result, dict):
                 logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
-                return
+                return False
 
             # Store summary as event node
             if summary := result.get("summary"):
@@ -618,8 +674,10 @@ Respond with ONLY valid JSON, no markdown fences."""
             else:
                 session.last_consolidated = len(session.messages) - keep_count
             logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+            return True
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
+            return False
 
     async def process_direct(
         self,

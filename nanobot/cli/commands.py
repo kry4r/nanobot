@@ -311,6 +311,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.session.manager import SessionManager
     from loguru import logger
     
     if verbose:
@@ -426,7 +427,9 @@ def gateway(
                         max_tokens=config.agents.defaults.max_tokens,
                         max_iterations=config.agents.defaults.max_tool_iterations,
                         memory_window=rcfg.memory_window or config.agents.defaults.memory_window,
+                        reasoning_effort=config.agents.defaults.reasoning_effort,
                         brave_api_key=config.tools.web.search.api_key or None,
+                        web_proxy=config.tools.web.proxy or None,
                         exec_config=config.tools.exec,
                         restrict_to_workspace=config.tools.restrict_to_workspace,
                         session_manager=rsm,
@@ -442,6 +445,59 @@ def gateway(
             logger.info("Extend-chat channel enabled")
         except ImportError as e:
             logger.warning(f"Extend-chat channel not available: {e}")
+
+    def _pick_heartbeat_target() -> tuple[str, str]:
+        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        enabled = set(channels.enabled_channels)
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if ":" not in key:
+                continue
+            channel, chat_id = key.split(":", 1)
+            if channel in {"cli", "system"}:
+                continue
+            if channel in enabled and chat_id:
+                return channel, chat_id
+        return "cli", "direct"
+
+    async def on_heartbeat_execute(tasks: str) -> str:
+        """Phase 2: execute heartbeat tasks through the full agent loop."""
+        channel, chat_id = _pick_heartbeat_target()
+
+        async def _silent(*_args, **_kwargs):
+            pass
+
+        return await agent.process_direct(
+            tasks,
+            session_key="heartbeat",
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=_silent,
+        )
+
+    async def on_heartbeat_notify(response: str) -> None:
+        """Deliver a heartbeat response to a routable non-cli channel."""
+        from nanobot.bus.events import OutboundMessage
+
+        channel, chat_id = _pick_heartbeat_target()
+        if channel == "cli":
+            return
+        await bus.publish_outbound(OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=response,
+        ))
+
+    hb_cfg = config.gateway.heartbeat
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        provider=provider,
+        model=agent.model,
+        on_execute=on_heartbeat_execute,
+        on_notify=on_heartbeat_notify,
+        interval_s=hb_cfg.interval_s,
+        enabled=hb_cfg.enabled,
+    )
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
