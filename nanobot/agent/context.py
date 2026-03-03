@@ -177,18 +177,7 @@ To recall past events, use the find_memory_cache tool."""
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: str,
     ) -> list[dict[str, Any]]:
-        """
-        Add a tool result to the message list.
-
-        Args:
-            messages: Current message list.
-            tool_call_id: ID of the tool call.
-            tool_name: Name of the tool.
-            result: Tool execution result.
-
-        Returns:
-            Updated message list.
-        """
+        # Add a tool result to the message list.
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -204,18 +193,7 @@ To recall past events, use the find_memory_cache tool."""
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Add an assistant message to the message list.
-
-        Args:
-            messages: Current message list.
-            content: Message content.
-            tool_calls: Optional tool calls.
-            reasoning_content: Thinking output (Kimi, DeepSeek-R1, etc.).
-
-        Returns:
-            Updated message list.
-        """
+        # Add an assistant message to the message list.
         msg: dict[str, Any] = {"role": "assistant"}
 
         # Omit empty content — some backends reject empty text blocks
