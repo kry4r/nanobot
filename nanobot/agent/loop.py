@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import json_repair
 from loguru import logger
@@ -652,7 +654,7 @@ Respond with ONLY valid JSON, no markdown fences."""
     # ── Streaming support (for ExtendChannel) ─────────────────────────────────
 
     async def _run_agent_loop_streaming(
-        self, initial_messages: list[dict]
+        self, initial_messages: list[dict], allow_tools: bool = True
     ) -> AsyncIterator[str]:
         """Run agent loop: tool calls execute normally, final response streams.
 
@@ -661,6 +663,16 @@ Respond with ONLY valid JSON, no markdown fences."""
         messages = initial_messages
         iteration = 0
         tools_used: list[str] = []
+
+        if not allow_tools:
+            async for chunk in self.provider.chat_stream(
+                messages=messages,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            ):
+                yield chunk
+            return
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -724,6 +736,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         summary_threshold: int = 20,
         extra_system_prompt: str | None = None,
         memory_namespace: str | None = None,
+        allow_tools: bool = True,
     ) -> AsyncIterator[str]:
         """Process a message with streaming response, using two-layer session context.
 
@@ -774,7 +787,7 @@ Respond with ONLY valid JSON, no markdown fences."""
 
         # Stream the response, collecting full text
         full_response = []
-        async for chunk in self._run_agent_loop_streaming(messages):
+        async for chunk in self._run_agent_loop_streaming(messages, allow_tools=allow_tools):
             full_response.append(chunk)
             yield chunk
 

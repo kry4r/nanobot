@@ -21,6 +21,7 @@ class ContextBuilder:
     """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
     def __init__(self, workspace: Path, memory: GraphMemoryStore | None = None):
         self.workspace = workspace
@@ -112,10 +113,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
-
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
-When remembering something important, use the create_memory tool.
-To recall past events, use the find_memory_cache tool."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

@@ -280,6 +280,7 @@ class ChannelsConfig(BaseModel):
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     mochat: MochatConfig = Field(default_factory=MochatConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+    matrix: MatrixConfig = Field(default_factory=MatrixConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)

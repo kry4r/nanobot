@@ -119,6 +119,7 @@ def _make_chat_handler(config: "ExtendChatConfig", robot_manager: "RobotManager"
             summary_threshold=config.summary_threshold,
             extra_system_prompt=extra_prompt,
             memory_namespace=memory_namespace,
+            allow_tools=False,
         ):
             chunks.append(chunk)
 

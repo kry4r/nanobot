@@ -311,6 +311,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.session.manager import SessionManager
     from loguru import logger
     
     if verbose:
@@ -348,6 +349,16 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+    )
+
+    # Create heartbeat service
+    hb_cfg = config.gateway.heartbeat
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        provider=provider,
+        model=config.agents.defaults.model,
+        interval_s=hb_cfg.interval_s,
+        enabled=hb_cfg.enabled,
     )
 
     # Set cron callback (needs agent)
